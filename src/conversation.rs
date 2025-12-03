@@ -20,6 +20,7 @@ use agent_client_protocol::{
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
+    create_config_summary_entries,
     model_presets::{ModelPreset, all_model_presets},
 };
 use codex_core::{
@@ -28,16 +29,17 @@ use codex_core::{
     error::CodexErr,
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
-        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ElicitationAction,
-        ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
-        ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExitedReviewModeEvent, FileChange,
-        ItemCompletedEvent, ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation,
-        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
-        Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
-        ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        SandboxPolicy, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent, TurnAbortedEvent,
-        UserMessageEvent, ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent,
-        WebSearchEndEvent,
+        AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, CreditsSnapshot,
+        ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
+        ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent,
+        ExitedReviewModeEvent, FileChange, ItemCompletedEvent, ItemStartedEvent,
+        ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
+        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, Op,
+        PatchApplyBeginEvent, PatchApplyEndEvent, RateLimitSnapshot, RateLimitWindow,
+        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
+        ReviewOutputEvent, ReviewRequest, SandboxPolicy, StreamErrorEvent, TaskCompleteEvent,
+        TaskStartedEvent, TokenCountEvent, TokenUsageInfo, TurnAbortedEvent, UserMessageEvent,
+        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
 };
@@ -286,6 +288,8 @@ struct PromptState {
     submission_id: String,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+    token_info: Rc<RefCell<Option<TokenUsageInfo>>>,
+    rate_limit_snapshot: Rc<RefCell<Option<RateLimitSnapshot>>>,
 }
 
 impl PromptState {
@@ -293,6 +297,8 @@ impl PromptState {
         conversation: Arc<dyn CodexConversationImpl>,
         response_tx: oneshot::Sender<Result<StopReason, Error>>,
         submission_id: String,
+        token_info: Rc<RefCell<Option<TokenUsageInfo>>>,
+        rate_limit_snapshot: Rc<RefCell<Option<RateLimitSnapshot>>>,
     ) -> Self {
         Self {
             active_command: None,
@@ -303,6 +309,8 @@ impl PromptState {
             submission_id,
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            token_info,
+            rate_limit_snapshot,
         }
     }
 
@@ -549,11 +557,13 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
+            EventMsg::TokenCount(TokenCountEvent { info, rate_limits }) => {
+                *self.token_info.borrow_mut() = info;
+                *self.rate_limit_snapshot.borrow_mut() = rate_limits;
+            }
 
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
-            // In the future we can use this to update usage stats
-            | EventMsg::TokenCount(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
             // Revisit when we can emit status updates
@@ -1301,12 +1311,20 @@ fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseC
 
 struct TaskState {
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
+    token_info: Rc<RefCell<Option<TokenUsageInfo>>>,
+    rate_limit_snapshot: Rc<RefCell<Option<RateLimitSnapshot>>>,
 }
 
 impl TaskState {
-    fn new(response_tx: oneshot::Sender<Result<StopReason, Error>>) -> Self {
+    fn new(
+        response_tx: oneshot::Sender<Result<StopReason, Error>>,
+        token_info: Rc<RefCell<Option<TokenUsageInfo>>>,
+        rate_limit_snapshot: Rc<RefCell<Option<RateLimitSnapshot>>>,
+    ) -> Self {
         Self {
             response_tx: Some(response_tx),
+            token_info,
+            rate_limit_snapshot,
         }
     }
 
@@ -1375,11 +1393,14 @@ impl TaskState {
                     "MCP startup complete: ready={ready:?}, failed={failed:?}, cancelled={cancelled:?}"
                 );
             }
+            EventMsg::TokenCount(TokenCountEvent { info, rate_limits }) => {
+                *self.token_info.borrow_mut() = info;
+                *self.rate_limit_snapshot.borrow_mut() = rate_limits;
+            }
             // Expected but ignore
             EventMsg::TaskStarted(..)
             | EventMsg::ItemStarted(..)
             | EventMsg::ItemCompleted(..)
-            | EventMsg::TokenCount(..)
             | EventMsg::AgentMessageDelta(..)
             | EventMsg::AgentReasoningDelta(..)
             | EventMsg::AgentMessageContentDelta(..)
@@ -1548,6 +1569,10 @@ struct ConversationActor<A> {
     config: Config,
     /// The custom prompts loaded for this workspace.
     custom_prompts: Rc<RefCell<Vec<CustomPrompt>>>,
+    /// Tracks the most recent token usage reported by Codex.
+    token_info: Rc<RefCell<Option<TokenUsageInfo>>>,
+    /// Tracks the most recent rate limit snapshot.
+    rate_limit_snapshot: Rc<RefCell<Option<RateLimitSnapshot>>>,
     /// A sender for each interested `Op` submission that needs events routed.
     submissions: HashMap<String, SubmissionState>,
     /// A receiver for incoming conversation messages.
@@ -1568,6 +1593,8 @@ impl<A: Auth> ConversationActor<A> {
             conversation,
             config,
             custom_prompts: Rc::default(),
+            token_info: Rc::default(),
+            rate_limit_snapshot: Rc::default(),
             submissions: HashMap::new(),
             message_rx,
         }
@@ -1671,6 +1698,12 @@ impl<A: Auth> ConversationActor<A> {
                 input: Some(AvailableCommandInput::Unstructured {
                     hint: "optional custom review instructions".into(),
                 }),
+                meta: None,
+            },
+            AvailableCommand {
+                name: "status".to_string(),
+                description: "show session status like model, approvals, and sandbox".into(),
+                input: None,
                 meta: None,
             },
             AvailableCommand {
@@ -1898,6 +1931,11 @@ impl<A: Auth> ConversationActor<A> {
                     self.auth.logout()?;
                     return Err(Error::auth_required());
                 }
+                "status" => {
+                    self.send_status_summary().await;
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
+                }
                 _ => {
                     if let Some(prompt) =
                         expand_custom_prompt(name, rest, self.custom_prompts.borrow().as_ref())
@@ -1925,17 +1963,192 @@ impl<A: Auth> ConversationActor<A> {
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
         let state = match op {
-            Op::Compact => SubmissionState::Task(TaskState::new(response_tx)),
+            Op::Compact => SubmissionState::Task(TaskState::new(
+                response_tx,
+                self.token_info.clone(),
+                self.rate_limit_snapshot.clone(),
+            )),
             _ => SubmissionState::Prompt(PromptState::new(
                 self.conversation.clone(),
                 response_tx,
                 submission_id.clone(),
+                self.token_info.clone(),
+                self.rate_limit_snapshot.clone(),
             )),
         };
 
         self.submissions.insert(submission_id, state);
 
         Ok(response_rx)
+    }
+
+    async fn send_status_summary(&self) {
+        let status = self.build_status_text();
+        self.client.send_agent_text(status).await;
+    }
+
+    fn build_status_text(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push("Status".to_string());
+        lines.push("------".to_string());
+        let session_id = self.client.session_id.0.as_ref();
+        lines.push(format!("- Session: {session_id}"));
+
+        let entries = create_config_summary_entries(&self.config);
+        let mut entry_map: HashMap<&str, String> = HashMap::new();
+        for (key, value) in entries {
+            entry_map.insert(key, value);
+        }
+
+        if let Some(model) = entry_map.get("model") {
+            let mut extras = Vec::new();
+            if let Some(effort) = entry_map.get("reasoning effort") {
+                extras.push(format!("reasoning {}", effort));
+            }
+            if let Some(summary) = entry_map.get("reasoning summaries") {
+                extras.push(format!("summaries {}", summary));
+            }
+            let suffix = if extras.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", extras.join(", "))
+            };
+            lines.push(format!("- Model: {model}{suffix}"));
+        }
+
+        if let Some(provider) = entry_map.get("provider") {
+            lines.push(format!("- Provider: {provider}"));
+        }
+        if let Some(approval) = entry_map.get("approval") {
+            lines.push(format!("- Approval: {approval}"));
+        }
+        if let Some(sandbox) = entry_map.get("sandbox") {
+            lines.push(format!("- Sandbox: {sandbox}"));
+        }
+        if let Some(workdir) = entry_map.get("workdir") {
+            lines.push(format!("- Workspace: {workdir}"));
+        }
+
+        let token_info = self.token_info.borrow().clone();
+        if let Some(info) = token_info {
+            let total = info.total_token_usage.blended_total();
+            let input = info.total_token_usage.non_cached_input();
+            let output = info.total_token_usage.output_tokens;
+            lines.push(format!(
+                "- Tokens: total {total} (input {input} + output {output})"
+            ));
+            if let Some(context_line) = self.context_window_summary(&info) {
+                lines.push(format!("  Context: {context_line}"));
+            }
+        } else {
+            lines.push("- Tokens: not available yet".to_string());
+            if let Some(window) = self.config.model_context_window {
+                lines.push(format!("- Context window: {window} tokens"));
+            }
+        }
+
+        let rate_limits = self.rate_limit_snapshot.borrow().clone();
+        match rate_limits {
+            Some(snapshot) => {
+                let details = Self::rate_limit_lines(&snapshot);
+                if details.is_empty() {
+                    lines.push("- Rate limits: no data reported yet".to_string());
+                } else {
+                    lines.push("- Rate limits:".to_string());
+                    for detail in details {
+                        lines.push(format!("  - {detail}"));
+                    }
+                }
+            }
+            None => lines.push("- Rate limits: not available yet".to_string()),
+        }
+
+        lines.join("\n")
+    }
+
+    fn context_window_summary(&self, info: &TokenUsageInfo) -> Option<String> {
+        let window = info
+            .model_context_window
+            .or(self.config.model_context_window)?;
+        if window <= 0 {
+            return None;
+        }
+        let used = info.last_token_usage.tokens_in_context_window().max(0);
+        let remaining = info
+            .last_token_usage
+            .percent_of_context_window_remaining(window);
+        Some(format!("{used}/{window} tokens (~{remaining}% free)"))
+    }
+
+    fn rate_limit_lines(snapshot: &RateLimitSnapshot) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(primary) = &snapshot.primary {
+            lines.push(Self::format_rate_limit_window("primary", primary));
+        }
+        if let Some(secondary) = &snapshot.secondary {
+            lines.push(Self::format_rate_limit_window("secondary", secondary));
+        }
+        if let Some(credits) = &snapshot.credits {
+            lines.push(Self::format_credit_line(credits));
+        }
+        lines
+    }
+
+    fn format_rate_limit_window(label: &str, window: &RateLimitWindow) -> String {
+        let percent = Self::format_percent(window.used_percent);
+        if let Some(duration) = Self::describe_window(window.window_minutes) {
+            format!("{label}: {percent} of {duration} window used")
+        } else {
+            format!("{label}: {percent} used")
+        }
+    }
+
+    fn format_credit_line(credits: &CreditsSnapshot) -> String {
+        if credits.unlimited {
+            "credits: unlimited".to_string()
+        } else if !credits.has_credits {
+            "credits: none available".to_string()
+        } else if let Some(balance) = &credits.balance {
+            format!("credits: {balance} remaining")
+        } else {
+            "credits: available".to_string()
+        }
+    }
+
+    fn format_percent(value: f64) -> String {
+        if !value.is_finite() {
+            return "-".to_string();
+        }
+        if (value - value.round()).abs() < 0.05 {
+            format!("{:.0}%", value)
+        } else {
+            format!("{value:.1}%")
+        }
+    }
+
+    fn describe_window(minutes: Option<i64>) -> Option<String> {
+        let minutes = minutes?;
+        if minutes <= 0 {
+            return None;
+        }
+        const MINUTES_PER_HOUR: i64 = 60;
+        const MINUTES_PER_DAY: i64 = 24 * MINUTES_PER_HOUR;
+        const MINUTES_PER_WEEK: i64 = 7 * MINUTES_PER_DAY;
+        const MINUTES_PER_MONTH: i64 = 30 * MINUTES_PER_DAY;
+
+        if minutes < MINUTES_PER_HOUR {
+            Some(format!("{minutes}m"))
+        } else if minutes % MINUTES_PER_HOUR == 0 && minutes < MINUTES_PER_DAY {
+            Some(format!("{}h", minutes / MINUTES_PER_HOUR))
+        } else if minutes % MINUTES_PER_DAY == 0 && minutes < MINUTES_PER_WEEK {
+            Some(format!("{}d", minutes / MINUTES_PER_DAY))
+        } else if minutes % MINUTES_PER_WEEK == 0 && minutes < MINUTES_PER_MONTH {
+            Some(format!("{}w", minutes / MINUTES_PER_WEEK))
+        } else if minutes % MINUTES_PER_MONTH == 0 {
+            Some(format!("{}mo", minutes / MINUTES_PER_MONTH))
+        } else {
+            Some(format!("{minutes}m"))
+        }
     }
 
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
@@ -2321,6 +2534,52 @@ mod tests {
         ));
         let ops = conversation.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Compact]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_status_command() -> anyhow::Result<()> {
+        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest {
+                session_id: session_id.clone(),
+                prompt: vec!["/status".into()],
+                meta: None,
+            },
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        let text = match &notifications[0].update {
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) => text.clone(),
+            other => panic!("Unexpected notification: {other:?}"),
+        };
+        assert!(
+            text.starts_with("Status"),
+            "status message should start with header, got {text}"
+        );
+        let ops = conversation.ops.lock().unwrap();
+        assert!(ops.is_empty(), "status should not submit ops: {ops:?}");
 
         Ok(())
     }
